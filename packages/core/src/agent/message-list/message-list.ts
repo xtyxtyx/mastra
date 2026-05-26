@@ -94,6 +94,37 @@ export class MessageList {
     return messages.map(message => AIV4Adapter.toUIMessage(message, options));
   }
 
+  private applyStoredModelOutputs(modelMessages: AIV5Type.ModelMessage[]): void {
+    const stored = new Map<string, unknown>();
+    for (const dbMsg of this.messages) {
+      if (dbMsg.content?.format !== 2 || !dbMsg.content.parts) continue;
+      for (const part of dbMsg.content.parts) {
+        if (
+          part.type === 'tool-invocation' &&
+          part.toolInvocation?.state === 'result' &&
+          part.providerMetadata?.mastra &&
+          typeof part.providerMetadata.mastra === 'object' &&
+          'modelOutput' in (part.providerMetadata.mastra as Record<string, unknown>)
+        ) {
+          stored.set(
+            part.toolInvocation.toolCallId,
+            (part.providerMetadata.mastra as Record<string, unknown>).modelOutput,
+          );
+        }
+      }
+    }
+    if (!stored.size) return;
+    for (const m of modelMessages) {
+      if (m.role !== 'tool' || !Array.isArray(m.content)) continue;
+      for (let i = 0; i < m.content.length; i++) {
+        const p = m.content[i]!;
+        if (p.type === 'tool-result' && stored.has(p.toolCallId)) {
+          m.content[i] = { ...p, output: stored.get(p.toolCallId) as any };
+        }
+      }
+    }
+  }
+
   // Event recording for observability
   private isRecording = false;
   private recordedEvents: Array<{
@@ -477,6 +508,8 @@ export class MessageList {
           this.filterIncompleteToolCalls,
         );
 
+        this.applyStoredModelOutputs(modelMessages);
+
         const messages = [...systemMessages, ...modelMessages];
 
         return ensureGeminiCompatibleMessages(messages, this.logger);
@@ -500,41 +533,8 @@ export class MessageList {
           this.filterIncompleteToolCalls,
         );
 
-        const storedModelOutputs = new Map<string, unknown>();
-        for (const dbMsg of this.messages) {
-          if (dbMsg.content?.format !== 2 || !dbMsg.content.parts) continue;
+        this.applyStoredModelOutputs(modelMessages);
 
-          for (const part of dbMsg.content.parts) {
-            if (
-              part.type === 'tool-invocation' &&
-              part.toolInvocation?.state === 'result' &&
-              part.providerMetadata?.mastra &&
-              typeof part.providerMetadata.mastra === 'object' &&
-              'modelOutput' in (part.providerMetadata.mastra as Record<string, unknown>)
-            ) {
-              storedModelOutputs.set(
-                part.toolInvocation.toolCallId,
-                (part.providerMetadata.mastra as Record<string, unknown>).modelOutput,
-              );
-            }
-          }
-        }
-
-        if (storedModelOutputs.size > 0) {
-          for (const modelMsg of modelMessages) {
-            if (modelMsg.role !== 'tool' || !Array.isArray(modelMsg.content)) continue;
-
-            for (let i = 0; i < modelMsg.content.length; i++) {
-              const part = modelMsg.content[i]!;
-              if (part.type === 'tool-result' && storedModelOutputs.has(part.toolCallId)) {
-                modelMsg.content[i] = {
-                  ...part,
-                  output: storedModelOutputs.get(part.toolCallId) as any,
-                };
-              }
-            }
-          }
-        }
         const systemMessages = convertAIV4CoreToAIV5ModelMessages(
           [...this.systemMessages, ...Object.values(this.taggedSystemMessages).flat()],
           `system`,
